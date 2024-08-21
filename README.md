@@ -13,7 +13,7 @@
 Ensure the following Python libraries are installed:
 
 ```bash
-pip install paho-mqtt pvlib pandas numpy
+pip install paho-mqtt pvlib pandas numpy tabulate
 ```
 
 ## Configuration
