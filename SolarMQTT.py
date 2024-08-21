@@ -20,16 +20,16 @@ MQTT_PASSWORD = "password"
 # Posizione geografica (Venezia)
 LATITUDE, LONGITUDE = 45.44, 12.33
 
-# Parametri del sistema fotovoltaico (espliciti)
+# Parametri del sistema fotovoltaico
 module_parameters = {
-    'pdc0': 220,  # Potenza nominale in DC
-    'gamma_pdc': -0.0047,  # Coefficiente di temperatura della potenza
-    't_noct': 47,  # Temperatura nominale di funzionamento della cella
+    'pdc0': 220,
+    'gamma_pdc': -0.0047,
+    't_noct': 47,
 }
 
 inverter_parameters = {
-    'pdc0': 250,  # Potenza nominale in DC supportata dall'inverter
-    'eta_inv_nom': 0.96,  # Efficienza nominale dell'inverter
+    'pdc0': 250,
+    'eta_inv_nom': 0.96,
 }
 
 pv_system = pvlib.pvsystem.PVSystem(
@@ -37,13 +37,14 @@ pv_system = pvlib.pvsystem.PVSystem(
     surface_azimuth=180,
     module_parameters=module_parameters,
     inverter_parameters=inverter_parameters,
-    racking_model='open_rack',  
+    racking_model='open_rack',
     module_type='glass_polymer',
 )
+
 location = pvlib.location.Location(LATITUDE, LONGITUDE, tz='Europe/Rome')
 
-# Creazione del client MQTT (corretto per il deprecation warning)
-client = mqtt.Client(protocol=mqtt.MQTTv311)  # Specifica il protocollo MQTTv311
+# Creazione del client MQTT
+client = mqtt.Client(protocol=mqtt.MQTTv311)
 client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
 
 def on_connect(client, userdata, flags, rc):
@@ -73,74 +74,52 @@ try:
         # Ottieni data e ora corrente
         now = pd.Timestamp(datetime.datetime.now(), tz='Europe/Rome')
 
-        # Check if it's nighttime
-        if now.hour < 6 or now.hour > 18:  # Adjust these hours based on your location and definition of nighttime
+        if now.hour < 6 or now.hour > 18:
             potenza_generata_kw = 0
         else:
-            # Calcola posizione del sole a mezzogiorno per ottenere l'ora del solar noon
-            solar_noon_position = pvlib.solarposition.get_solarposition(
-                pd.Timestamp(now.date(), tz='Europe/Rome') + pd.Timedelta(hours=12), 
-                LATITUDE,
-                LONGITUDE
-            )
-            solar_noon = solar_noon_position.index[0]
+            try:
+                # Calcola posizione del sole
+                solpos = pvlib.solarposition.get_solarposition(now, LATITUDE, LONGITUDE)
+                logging.info(f"Solar Position: {solpos}")
+                
+                dni_extra = pvlib.irradiance.get_extra_radiation(now)
+                logging.info(f"DNI Extra: {dni_extra}")
 
-            # Calcola posizione del sole, ecc.
-            solpos = pvlib.solarposition.get_solarposition(now, LATITUDE, LONGITUDE)
-            dni_extra = pvlib.irradiance.get_extra_radiation(now)
-            I0h = pvlib.irradiance.get_extra_radiation(solar_noon)
+                # Calcola l'irradiamento globale orizzontale (GHI), diretto normale (DNI), e diffuso orizzontale (DHI)
+                ghi = dni_extra * np.cos(np.radians(solpos['apparent_zenith']))
+                dhi = ghi * 0.1  # Assumiamo un valore per DHI (da migliorare)
+                dni = dni_extra  # Assumiamo che DNI sia uguale a DNI extra (da migliorare)
 
-            # Handle cases where kt is None or zero
-            if I0h == 0 or dni_extra == 0:
-                kt = 0
-            else:
-                kt = dni_extra / I0h
+                # Crea un DataFrame con i dati meteo
+                weather_data = pd.DataFrame({
+                    'ghi': [ghi.iloc[0]],  # Estrai il valore float con .iloc[0]
+                    'dni': [dni],
+                    'dhi': [dhi.iloc[0]]   # Estrai il valore float con .iloc[0]
+                }, index=[now])
 
-            # Calcola l'irraggiamento, handling cases where kt is zero
-            ghi = pd.Series(kt * I0h if kt else 0, index=[now])
-            dhi = pd.Series((kt * I0h) - dni_extra * pvlib.tools.cosd(solpos['apparent_zenith']) if kt else 0, index=[now])
-            poa_irradiance = pvlib.irradiance.get_total_irradiance(
-                surface_tilt=30,
-                surface_azimuth=180,
-                solar_zenith=solpos['apparent_zenith'],
-                solar_azimuth=solpos['azimuth'],
-                dni=dni_extra,
-                ghi=ghi,
-                dhi=dhi,
-                airmass=pvlib.atmosphere.get_relative_airmass(solpos['apparent_zenith']),
-                albedo=0.2
-            )
+                logging.info(f"Weather Data: {weather_data}")
 
-            # Calcola GHI direttamente da POA irradiance components
-            ghi = pvlib.irradiance.get_total_irradiance(
-                surface_tilt=0,
-                surface_azimuth=180,
-                solar_zenith=solpos['apparent_zenith'],
-                solar_azimuth=solpos['azimuth'],
-                dni=poa_irradiance['poa_direct'] / pvlib.tools.cosd(solpos['apparent_zenith']),
-                ghi=None,
-                dhi=poa_irradiance['poa_diffuse'],
-                airmass=pvlib.atmosphere.get_relative_airmass(solpos['apparent_zenith']),
-                albedo=0.2
-            )['ghi']
+                # Esegui il calcolo della potenza generata
+                mc = pvlib.modelchain.ModelChain(pv_system, location, aoi_model='no_loss', spectral_model='no_loss', temperature_model='sapm')
+                mc.run_model(weather=weather_data)
 
-            dni = poa_irradiance['poa_direct'] / pvlib.tools.cosd(solpos['apparent_zenith'])
-            dhi = ghi - dni
+                # Stampa i risultati per debug
+                logging.info(f"ModelChain Results: {mc.results}")
 
-            # Create a DataFrame with the calculated GHI, DNI, and DHI
-            weather = pd.DataFrame({'ghi': ghi, 'dni': dni, 'dhi': dhi}, index=[now])
+                # Controllo e estrazione del valore DC
+                if isinstance(mc.results.dc, pd.Series):
+                    potenza_generata_kw = mc.results.dc.iloc[0] / 1000  # Utilizza il valore DC direttamente
+                else:
+                    logging.error("Risultato DC non trovato o non è una Series.")
+                    potenza_generata_kw = 0
 
-            # Crea il ModelChain specificando il modello di temperatura
-            mc = pvlib.modelchain.ModelChain(pv_system, location, aoi_model='no_loss', spectral_model='no_loss', temperature_model='sapm')
-            mc.run_model(weather=weather)
-
-            # Calcola la potenza generata
-            mc.results.dc = mc.results.dc.reset_index(drop=True)
-            potenza_generata_kw = mc.results.dc['p_mp'].values[0] / 1000
+            except Exception as e:
+                logging.error(f"Errore durante il calcolo dell'irraggiamento: {e}")
+                potenza_generata_kw = 0
 
         # Pubblica i dati
         client.publish(MQTT_TOPIC, str(potenza_generata_kw))
-        print(f"Potenza generata: {potenza_generata_kw:.2f} kW inviata al topic {MQTT_TOPIC}")
+        logging.info(f"Potenza generata: {potenza_generata_kw:.2f} kW inviata al topic {MQTT_TOPIC}")
 
         # Attesa per completare i 60 secondi
         time.sleep(max(0, 60 - (time.time() - start_time)))
@@ -149,6 +128,5 @@ except KeyboardInterrupt:
     logging.info("Script interrotto dall'utente.")
 
 finally:
-    # Disconnessione
     client.loop_stop()
     client.disconnect()
